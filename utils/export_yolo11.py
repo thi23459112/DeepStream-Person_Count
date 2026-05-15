@@ -9,20 +9,9 @@ from ultralytics import YOLO
 from ultralytics.nn.modules import C2f, Detect, v10Detect
 import ultralytics.utils
 import ultralytics.models.yolo
-import ultralytics.utils.tal as _m
 
 sys.modules["ultralytics.yolo"] = ultralytics.models.yolo
 sys.modules["ultralytics.yolo.utils"] = ultralytics.utils
-
-
-def _dist2bbox(distance, anchor_points, xywh=False, dim=-1):
-    lt, rb = distance.chunk(2, dim)
-    x1y1 = anchor_points - lt
-    x2y2 = anchor_points + rb
-    return torch.cat((x1y1, x2y2), dim)
-
-
-_m.dist2bbox.__code__ = _dist2bbox.__code__
 
 
 class DeepStreamOutput(nn.Module):
@@ -30,8 +19,18 @@ class DeepStreamOutput(nn.Module):
         super().__init__()
 
     def forward(self, x):
-        x = x.transpose(1, 2)
-        boxes = x[:, :, :4]
+        # x: [batch, 4+num_classes, 8400]
+        x = x.transpose(1, 2)                                  # → [batch, 8400, 4+num_classes]
+        boxes = x[:, :, :4]                                    # [batch, 8400, 4] (cx, cy, w, h)
+
+        # cxcywh → xyxy
+        cx, cy, w, h = boxes.unbind(dim=-1)
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+        boxes = torch.stack([x1, y1, x2, y2], dim=-1)          # [batch, 8400, 4]
+
         scores, labels = torch.max(x[:, :, 4:], dim=-1, keepdim=True)
         return torch.cat([boxes, scores, labels.to(boxes.dtype)], dim=-1)
 
@@ -71,7 +70,8 @@ def main(args):
 
     print("Opening YOLO11 model")
 
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     model = yolo11_export(args.weights, device)
 
     if len(model.names.keys()) > 0:
@@ -79,7 +79,7 @@ def main(args):
         # 例如 args.weights 是 "path/to/car.pt"，base_name 會是 "car"
         base_name = os.path.basename(args.weights).rsplit(".", 1)[0]
         labels_filename = f"labels_{base_name}.txt"
-        
+
         print(f"Creating {labels_filename} file")
         with open(labels_filename, "w", encoding="utf-8") as f:
             for name in model.names.values():
@@ -89,7 +89,8 @@ def main(args):
 
     img_size = args.size * 2 if len(args.size) == 1 else args.size
 
-    onnx_input_im = torch.zeros(args.batch, 3, *img_size).to(device)
+    # 用隨機輸入（不是全 0），避免 trace 走錯分支
+    onnx_input_im = torch.rand(args.batch, 3, *img_size).to(device)
     onnx_output_file = args.weights.rsplit(".", 1)[0] + ".onnx"
 
     dynamic_axes = {
@@ -129,7 +130,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="DeepStream YOLO11 conversion")
     parser.add_argument("-w", "--weights", required=True, type=str, help="Input weights (.pt) file path (required)")
     parser.add_argument("-s", "--size", nargs="+", type=int, default=[640], help="Inference size [H,W] (default [640])")
-    parser.add_argument("--opset", type=int, default=18, help="ONNX opset version")
+    parser.add_argument("--opset", type=int, default=12, help="ONNX opset version")
     parser.add_argument("--simplify", action="store_true", help="ONNX simplify model")
     parser.add_argument("--dynamic", action="store_true", help="Dynamic batch-size")
     parser.add_argument("--batch", type=int, default=1, help="Static batch-size")
